@@ -1,0 +1,1 @@
+kubectl patch statefulset postgres-query -p '{"spec":{"template":{"spec":{"containers":[{"name":"postgres","command":["/bin/sh","-c","sleep 3600"]}]}}}}'

@@ -1,0 +1,335 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+data:
+  POSTGRES_DB: postgres
+  POSTGRES_USER: postgres
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secrets
+type: Opaque
+data:
+  # Estas senhas são substituídas pelas geradas durante o build se não existirem no volume persistente
+  # Base64 de "postgres"
+  postgres-password: cG9zdGdyZXM=
+  # Base64 de "replicator_password"
+  replication-password: cmVwbGljYXRvcl9wYXNzd29yZA==
+---
+# StorageClass para provisionamento dinâmico de volumes
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: postgres-storage
+provisioner: kubernetes.io/no-provisioner
+# Alternativa: usar um provisioner cloud específico como:
+# provisioner: kubernetes.io/aws-ebs
+# provisioner: kubernetes.io/gce-pd
+# provisioner: kubernetes.io/azure-disk
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+---
+# PersistentVolume para dados do PostgreSQL
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgres-pv
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: postgres-storage
+  hostPath:
+    path: /data/postgresql
+    type: DirectoryOrCreate
+---
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgres-query-pv
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: postgres-storage
+  hostPath:
+    path: /data/postgresql-query
+    type: DirectoryOrCreate
+---
+
+# PersistentVolumeClaim para PostgreSQL
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: postgres-storage
+  resources:
+    requests:
+      storage: 10Gi
+---
+# StatefulSet para nós de comando (escrita)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-command
+spec:
+  serviceName: postgres-command
+  replicas: 1  # Normalmente apenas um nó de comando primário
+  selector:
+    matchLabels:
+      app: postgres
+      role: command
+  template:
+    metadata:
+      labels:
+        app: postgres
+        role: command
+    spec:
+      initContainers:
+      - name: init-postgresql
+        image: christavas/nl-postgres-alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - mkdir -p /run/postgresql && chmod 0777 /run/postgresql && chown 70:70 /run/postgresql
+        - echo "host replication replicator 0.0.0.0/0 md5" >> /data/pgdata/pg_hba.conf
+        - pg_ctl reload
+        securityContext:
+          runAsUser: 0  # Run as root to ensure permissions
+    
+      containers:
+      - name: postgres
+        image: christavas/nl-postgres-alpine:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 5432
+          name: psql
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /data
+        - name: postgresql-run
+          mountPath: /run/postgresql
+        env:
+        - name: CQRS_MODE
+          value: "command"
+        - name: PGDATA
+          value: "/data/pgdata"
+        - name: POSTGRES_DB
+          valueFrom:
+            configMapKeyRef:
+              name: postgres-config
+              key: POSTGRES_DB
+        - name: POSTGRES_USER
+          valueFrom:
+            configMapKeyRef:
+              name: postgres-config
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secrets
+              key: postgres-password
+        - name: POSTGRES_REPLICATION_USER
+          value: "replicator"
+        - name: POSTGRES_REPLICATION_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secrets
+              key: replication-password
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "$(POSTGRES_USER)"]
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+        livenessProbe:
+          exec:
+            command: ["pg_isready", "-U", "$(POSTGRES_USER)"]
+          initialDelaySeconds: 60
+          periodSeconds: 20
+          timeoutSeconds: 5
+      volumes:
+      - name: postgres-data
+        persistentVolumeClaim:
+          claimName: postgres-pvc
+      - name: postgresql-run
+        emptyDir: {}
+
+---
+# StatefulSet para nós de consulta (leitura)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-query
+spec:
+  serviceName: postgres-query
+  replicas: 2  # Você pode escalar os nós de leitura conforme necessário
+  selector:
+    matchLabels:
+      app: postgres
+      role: query
+  template:
+    metadata:
+      labels:
+        app: postgres
+        role: query
+    spec:
+      initContainers:
+      - name: init-postgresql
+        image: christavas/nl-postgres-alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - mkdir -p /run/postgresql && chmod 0777 /run/postgresql && chown 70:70 /run/postgresql        
+        - |
+          until pg_isready -h postgres-command-0.postgres-command; do
+            sleep 2
+          done
+        - pg_basebackup -h postgres-command-0.postgres-command -U replicator -D /data/pgdata -P -R -X stream -C -S pgquery
+        securityContext:
+          runAsUser: 0  # Run as root to ensure permissions
+      containers:
+      - name: postgres
+        image: christavas/nl-postgres-alpine:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 5432
+          name: psql
+        volumeMounts:
+        - name: postgres-query-data
+          mountPath: /data
+        - name: postgresql-query-run
+          mountPath: /run/postgresql
+        env:
+        - name: CQRS_MODE
+          value: "query"
+        - name: POSTGRES_HOST
+          value: "postgres-command-0.postgres-command"
+        - name: PGDATA
+          value: "/data/pgdata"
+        - name: POSTGRES_DB
+          valueFrom:
+            configMapKeyRef:
+              name: postgres-config
+              key: POSTGRES_DB
+        - name: POSTGRES_USER
+          valueFrom:
+            configMapKeyRef:
+              name: postgres-config
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secrets
+              key: postgres-password
+        - name: POSTGRES_REPLICATION_USER
+          value: "replicator"
+        - name: POSTGRES_REPLICATION_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secrets
+              key: replication-password
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "$(POSTGRES_USER)"]
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+        livenessProbe:
+          exec:
+            command: ["pg_isready", "-U", "$(POSTGRES_USER)"]
+          initialDelaySeconds: 60
+          periodSeconds: 20
+          timeoutSeconds: 5
+      volumes:
+      - name: postgres-query-data
+        persistentVolumeClaim:
+          claimName: postgres-pvc
+      - name: postgresql-query-run
+        emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-query-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: postgres-storage
+      resources:
+        requests:
+          storage: 10Gi
+---
+# Serviço para nós de comando (escrita)
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-command
+  labels:
+    app: postgres
+    role: command
+spec:
+  ports:
+  - port: 5432
+    targetPort: 5432
+    name: psql
+  selector:
+    app: postgres
+    role: command
+---
+# Serviço para nós de consulta (leitura)
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-query
+  labels:
+    app: postgres
+    role: query
+spec:
+  ports:
+  - port: 5432
+    targetPort: 5432
+    name: psql
+  selector:
+    app: postgres
+    role: query
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-readwrite
+spec:
+  selector:
+    app: postgres
+    role: command
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-readonly
+spec:
+  selector:
+    app: postgres
+    role: query
+  ports:
+    - port: 5432
+      targetPort: 5432
